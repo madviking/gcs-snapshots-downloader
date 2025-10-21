@@ -21,7 +21,15 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-STATE_FILE="${1:?Usage: $0 <STATE_FILE>}"
+ARG1="${1:?Usage: $0 <STATE_FILE|SESSION_NAME>}"
+
+if [[ -f "${ARG1}" ]]; then
+  STATE_FILE="${ARG1}"
+elif [[ -f "./exports/${ARG1}.state" ]]; then
+  STATE_FILE="./exports/${ARG1}.state"
+else
+  STATE_FILE="${ARG1}"
+fi
 
 if [[ ! -f "${STATE_FILE}" ]]; then
   echo "[!] State file not found: ${STATE_FILE}"

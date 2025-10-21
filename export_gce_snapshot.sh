@@ -8,7 +8,7 @@ set -euo pipefail
 # cleans up compute resources.
 #
 # Usage:
-#   ./transfer.sh <SNAPSHOT_NAME> <REGION> [--keep-remote]
+#   ./export_gce_snapshot.sh <SNAPSHOT_NAME> <REGION> [--keep-remote] [--skip-local] [--out-dir PATH]
 #
 # Example:
 #   ./transfer.sh my-data-snap us-central1 --keep-remote
@@ -33,7 +33,7 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 <SNAPSHOT_NAME> <REGION> [--keep-remote] [--out-dir PATH]
+Usage: $0 <SNAPSHOT_NAME> <REGION> [--keep-remote] [--skip-local] [--out-dir PATH] [--name NAME] [--silent]
 
 Exports filesystem contents from a GCE snapshot to compressed tarballs, stored
 in a temporary GCS bucket and then copied locally to ./exports/<prefix>.
@@ -42,7 +42,10 @@ Arguments:
   SNAPSHOT_NAME   Existing snapshot name in the active project
   REGION          Region for temporary resources (e.g. us-central1)
   --keep-remote   Keep the GCS bucket/objects (skip storage cleanup)
+  --skip-local    Do not download from GCS (leave objects in bucket)
   --out-dir PATH  Download artifacts to PATH instead of ./exports/<prefix>
+  --name NAME     Friendly alias for this session (creates exports/NAME.state)
+  --silent        Do not prompt for confirmation (acknowledge costs)
 
 Prerequisites:
   - Google Cloud SDK installed
@@ -60,7 +63,10 @@ Benefits of this approach:
 
 Examples:
   $0 my-snap us-central1 --keep-remote
+  $0 my-snap us-central1 --skip-local
   $0 my-snap us-central1 --out-dir /tmp/export
+  $0 my-snap us-central1 --name docker
+  $0 my-snap us-central1 --silent
 EOF
 }
 
@@ -79,13 +85,22 @@ REGION="$2"
 shift 2
 
 KEEP_REMOTE="0"
+SKIP_LOCAL="0"
 OUT_DIR=""
+SESSION_NAME=""
+SILENT="0"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep-remote)
       KEEP_REMOTE="1"; shift ;;
     --out-dir)
       OUT_DIR="${2:?--out-dir requires a PATH}"; shift 2 ;;
+    --name)
+      SESSION_NAME="${2:?--name requires a NAME}"; shift 2 ;;
+    --silent|-y|--yes)
+      SILENT="1"; shift ;;
+    --skip-local)
+      SKIP_LOCAL="1"; shift ;;
     -h|--help)
       usage; exit 0 ;;
     *)
@@ -106,6 +121,7 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 RAND8="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 8 || echo $$)"
 
 sanitize() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g; s/-+/-/g; s/^-+//; s/-+$//'; }
+sanitize_name() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/-+/-/g; s/^-+//; s/-+$//'; }
 
 SNAP_SAFE="$(sanitize "${SNAPSHOT_NAME}")"
 PROJ_SAFE="$(sanitize "${PROJECT}")"
@@ -122,8 +138,13 @@ fi
 REMOTE_PREFIX="files-${SNAP_SAFE}-${TIMESTAMP}-${RAND8}"
 EXPORTS_DIR="./exports"
 if [[ -n "${OUT_DIR}" ]]; then
-  LOCAL_DIR="${OUT_DIR}"
-  STATE_FILE="${OUT_DIR}.state"
+  BASE_NAME="${SNAPSHOT_NAME}"
+  if [[ -n "${SESSION_NAME:-}" ]]; then
+    BASE_NAME="${SESSION_NAME}"
+  fi
+  # Create a per-session subfolder under the provided out-dir named after snapshot or --name
+  LOCAL_DIR="${OUT_DIR%/}/$(sanitize_name "${BASE_NAME}")"
+  STATE_FILE="${LOCAL_DIR}.state"
 else
   LOCAL_DIR="${EXPORTS_DIR}/${REMOTE_PREFIX}"
   STATE_FILE="${EXPORTS_DIR}/${REMOTE_PREFIX}.state"
@@ -132,6 +153,11 @@ mkdir -p "$(dirname "${STATE_FILE}")" "${LOCAL_DIR}"
 
 # ---- helpers ----
 log() { echo "[$(date +%H:%M:%S)] $*"; }
+hr_bytes() {
+  local b=$1 d='' s=0 S=(Bytes KB MB GB TB PB EB ZB YB)
+  while [[ "$b" =~ ^[0-9]+$ ]] && (( b>1024 && s<${#S[@]}-1 )); do d=$(printf ".%02d" $(( (b%1024)*100/1024 ))); b=$((b/1024)); s=$((s+1)); done
+  printf "%s%s %s" "$b" "$d" "${S[$s]}"
+}
 log_state() { echo "$*" >> "${STATE_FILE}"; }
 on_error() {
   log "ERROR detected. Invoking cleanup with ${STATE_FILE} …"
@@ -144,6 +170,59 @@ log "Snapshot: ${SNAPSHOT_NAME}"
 log "Region: ${REGION}"
 log "State file: ${STATE_FILE}"
 
+# Snapshot size (best-effort)
+SNAP_DISK_GB="$(gcloud compute snapshots describe "${SNAPSHOT_NAME}" --format='value(diskSizeGb)' 2>/dev/null || true)"
+SNAP_STORAGE_BYTES="$(gcloud compute snapshots describe "${SNAPSHOT_NAME}" --format='value(storageBytes)' 2>/dev/null || true)"
+if [[ -n "${SNAP_DISK_GB}" || -n "${SNAP_STORAGE_BYTES}" ]]; then
+  if [[ -n "${SNAP_STORAGE_BYTES}" ]]; then
+    HSIZE="$(hr_bytes "${SNAP_STORAGE_BYTES}")"
+    log "Snapshot size (storage bytes): ${HSIZE}"
+  fi
+  if [[ -n "${SNAP_DISK_GB}" ]]; then
+    log "Snapshot disk size: ${SNAP_DISK_GB} GB"
+  fi
+fi
+
+# Visualize plan
+TOTAL_STEPS=10
+[[ "${SKIP_LOCAL}" == "1" ]] && TOTAL_STEPS=$((TOTAL_STEPS-1))
+[[ "${KEEP_REMOTE}" == "1" ]] && TOTAL_STEPS=$((TOTAL_STEPS-1))
+cat <<EOF
+Planned steps (${TOTAL_STEPS} total):
+  1) Enable required APIs
+  2) Select an UP zone in region
+  3) Create temporary GCS bucket
+  4) Create disk from snapshot
+  5) Create temporary VM
+  6) Attach disk to VM
+  7) Stream filesystem to GCS (VM -> bucket)
+  8) Download from GCS locally (resumable)${SKIP_LOCAL:+ [skipped]}
+  9) Cleanup compute resources (VM, disk)
+ 10) Cleanup storage (bucket/objects)${KEEP_REMOTE:+ [skipped]}
+EOF
+
+STEP_IDX=0
+next_step() { STEP_IDX=$((STEP_IDX+1)); log "Step ${STEP_IDX}/${TOTAL_STEPS}: $*"; }
+
+# Cost confirmation unless --silent
+if [[ "${SILENT}" != "1" ]]; then
+  echo
+  echo "About to create temporary Compute resources and a Storage bucket in project '${PROJECT}', region '${REGION}'."
+  echo "These actions may incur costs while resources exist and for data stored/transferred."
+  [[ -n "${SNAP_STORAGE_BYTES}" ]] && echo "Estimated snapshot storage bytes: $(hr_bytes "${SNAP_STORAGE_BYTES}")"
+  echo
+  if [[ -t 0 ]]; then
+    read -r -p "Proceed? [y/N]: " RESP
+    case "${RESP}" in
+      y|Y|yes|YES) : ;; 
+      *) echo "Aborted."; exit 0 ;;
+    esac
+  else
+    echo "Non-interactive shell detected. Re-run with --silent to acknowledge costs."
+    exit 1
+  fi
+fi
+
 # seed state file
 cat > "${STATE_FILE}" <<EOF
 # gce-snapshot-export state
@@ -154,18 +233,21 @@ TIMESTAMP=${TIMESTAMP}
 RAND8=${RAND8}
 REMOTE_PREFIX=${REMOTE_PREFIX}
 LOCAL_DIR=${LOCAL_DIR}
+STATE_FILE=${STATE_FILE}
+BUCKET=${BUCKET}
 EOF
 
-log "Enabling APIs (idempotent)…"
+next_step "Enable required APIs"
 gcloud services enable compute.googleapis.com storage.googleapis.com >/dev/null
 
-log "Selecting an UP zone in ${REGION}…"
+next_step "Select an UP zone in ${REGION}"
 ZONE="$(gcloud compute zones list --filter="name~'^${REGION}-' AND status=UP" --format='value(name)' | head -n1)"
 [[ -z "${ZONE}" ]] && { echo "No UP zones in ${REGION}"; exit 3; }
 log "Using zone: ${ZONE}"
 log_state "ZONE=${ZONE}"
 
-log "Creating temp bucket: gs://${BUCKET} (location=${REGION})"
+next_step "Create temporary GCS bucket"
+log "Creating bucket: gs://${BUCKET} (location=${REGION})"
 gcloud storage buckets create "gs://${BUCKET}" --location="${REGION}" --uniform-bucket-level-access >/dev/null
 log_state "BUCKET=${BUCKET}"
 
@@ -175,14 +257,16 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${COMP_SA}" \
   --role="roles/storage.objectAdmin" >/dev/null || true
 
-log "Creating temp disk from snapshot: ${TMP_DISK}"
+next_step "Create disk from snapshot"
+log "Disk: ${TMP_DISK}"
 gcloud compute disks create "${TMP_DISK}" \
   --source-snapshot="${SNAPSHOT_NAME}" \
   --zone="${ZONE}" \
   --project="${PROJECT}" >/dev/null
 log_state "DISK=${TMP_DISK}"
 
-log "Creating tiny VM: ${VM}"
+next_step "Create temporary VM"
+log "VM: ${VM}"
 gcloud compute instances create "${VM}" \
   --zone="${ZONE}" \
   --machine-type="e2-micro" \
@@ -192,7 +276,7 @@ gcloud compute instances create "${VM}" \
   --scopes="https://www.googleapis.com/auth/cloud-platform" >/dev/null
 log_state "VM=${VM}"
 
-log "Attaching disk to VM…"
+next_step "Attach disk to VM"
 gcloud compute instances attach-disk "${VM}" \
   --zone="${ZONE}" \
   --disk="${TMP_DISK}" \
@@ -207,9 +291,9 @@ for i in {1..24}; do
   [[ $i -eq 24 ]] && { echo "SSH not ready in time"; exit 4; }
 done
 
-log "Mounting and streaming partitions as tar.gz to GCS…"
+next_step "Stream filesystem to GCS (VM -> bucket)"
 REMOTE_SCRIPT="${EXPORTS_DIR}/${REMOTE_PREFIX}.remote.sh"
-cat > "${REMOTE_SCRIPT}" <<'EOS'
+cat > "${REMOTE_SCRIPT}.body" <<'EOS'
 set -euo pipefail
 sudo mkdir -p /mnt/snap
 
@@ -280,17 +364,66 @@ fi
 echo OK | gsutil cp - "gs://$BUCKET/$REMOTE_PREFIX/_OK"
 EOS
 
-# inject variables at the top (to avoid local expansion issues above)
-sed -i '' "1s;^;BUCKET='${BUCKET}'\nREMOTE_PREFIX='${REMOTE_PREFIX}'\nTMP_DISK='${TMP_DISK}'\n;" "${REMOTE_SCRIPT}"
+# Write header with variables and append body to form the remote script
+{
+  echo "BUCKET='${BUCKET}'"
+  echo "REMOTE_PREFIX='${REMOTE_PREFIX}'"
+  echo "TMP_DISK='${TMP_DISK}'"
+  cat "${REMOTE_SCRIPT}.body"
+} > "${REMOTE_SCRIPT}"
 
 gcloud compute scp --zone "${ZONE}" "${REMOTE_SCRIPT}" "${VM}:/tmp/transfer.sh" >/dev/null
 gcloud compute ssh "${VM}" --zone "${ZONE}" --command "bash /tmp/transfer.sh"
 
-log "Downloading to local: ${LOCAL_DIR}"
-gcloud storage cp -r "gs://${BUCKET}/${REMOTE_PREFIX}/*" "${LOCAL_DIR}/"
+# Create friendly session symlinks (if requested)
+if [[ -n "${SESSION_NAME}" ]]; then
+  NAME_SAFE="$(sanitize_name "${SESSION_NAME}")"
+  ln -sfn "${STATE_FILE}" "${EXPORTS_DIR}/${NAME_SAFE}.state" || true
+  case "${LOCAL_DIR}" in
+    ${EXPORTS_DIR}/*) ln -sfn "${LOCAL_DIR}" "${EXPORTS_DIR}/${NAME_SAFE}" || true ;;
+  esac
+  echo -e "${NAME_SAFE}\t${STATE_FILE}\t${BUCKET}\t${REMOTE_PREFIX}\t${TIMESTAMP}" >> "${EXPORTS_DIR}/sessions.tsv"
+fi
 
-if [[ ! -f "${LOCAL_DIR}/_OK" ]]; then
-  log "WARNING: No _OK marker found; export may be incomplete."
+# Disable trap around local download so failures don’t trigger full cleanup
+trap - ERR
+DL_RC=0
+if [[ "${SKIP_LOCAL}" == "1" ]]; then
+  log "Skipping local download (--skip-local). Artifacts remain in gs://${BUCKET}/${REMOTE_PREFIX}"
+else
+  next_step "Download from GCS to local (resumable)"
+  log "Destination: ${LOCAL_DIR}"
+  # Run download with tolerant error handling and fallbacks
+  set +e
+  if command -v gsutil >/dev/null 2>&1; then
+    gsutil -m rsync -r -c "gs://${BUCKET}/${REMOTE_PREFIX}" "${LOCAL_DIR}/"
+    DL_RC=$?
+    if [[ $DL_RC -ne 0 ]]; then
+      log "gsutil rsync failed (rc=$DL_RC); falling back to gcloud storage rsync/cp"
+      if gcloud storage rsync --help >/dev/null 2>&1; then
+        gcloud storage rsync "gs://${BUCKET}/${REMOTE_PREFIX}" "${LOCAL_DIR}/"
+        DL_RC=$?
+      else
+        gcloud storage cp -r "gs://${BUCKET}/${REMOTE_PREFIX}/*" "${LOCAL_DIR}/"
+        DL_RC=$?
+      fi
+    fi
+  else
+    if gcloud storage rsync --help >/dev/null 2>&1; then
+      gcloud storage rsync "gs://${BUCKET}/${REMOTE_PREFIX}" "${LOCAL_DIR}/"
+      DL_RC=$?
+    else
+      gcloud storage cp -r "gs://${BUCKET}/${REMOTE_PREFIX}/*" "${LOCAL_DIR}/"
+      DL_RC=$?
+    fi
+  fi
+  set -e
+
+  if [[ $DL_RC -ne 0 ]]; then
+    log "Download encountered errors (rc=$DL_RC). Remote artifacts kept for manual retry."
+  elif [[ ! -f "${LOCAL_DIR}/_OK" ]]; then
+    log "WARNING: No _OK marker found; export may be incomplete."
+  fi
 fi
 
 # ---- cleanup (always delete compute; optionally keep storage) ----
@@ -299,8 +432,8 @@ gcloud compute instances detach-disk "${VM}" --disk="${TMP_DISK}" --zone="${ZONE
 gcloud compute instances delete "${VM}" --zone="${ZONE}" --quiet >/dev/null || true
 gcloud compute disks delete "${TMP_DISK}" --zone="${ZONE}" --quiet >/dev/null || true
 
-if [[ "${KEEP_REMOTE}" == "1" ]]; then
-  log "Keeping remote bucket/objects as requested."
+if [[ "${KEEP_REMOTE}" == "1" || "${SKIP_LOCAL}" == "1" || "${DL_RC:-0}" -ne 0 ]]; then
+  log "Keeping remote bucket/objects (explicit keep, skipped local, or download error)."
 else
   log "Cleaning up storage artifacts…"
   gcloud storage rm -r "gs://${BUCKET}/${REMOTE_PREFIX}" >/dev/null || true
