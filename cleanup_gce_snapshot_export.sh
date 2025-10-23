@@ -3,16 +3,17 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-Usage: $0 <STATE_FILE>
+Usage: $0 [--include-compute] <STATE_FILE|SESSION_NAME>
 
-Cleans up temporary resources created by transfer.sh using the recorded state.
-
-Arguments:
-  STATE_FILE   Path to the .state file emitted by transfer.sh
+Cleans up artifacts created by export_gce_snapshot.sh using the recorded state.
+By default only Storage artifacts are removed (objects + bucket). The exporter
+already deletes compute resources right after upload to GCS. Pass
+--include-compute to also attempt VM/disk cleanup (idempotent).
 
 Examples:
-  $0 ./exports/files-<prefix>.state
-  $0 /custom/output/path.state
+  $0 ./exports/<prefix>.state
+  $0 docker
+  $0 --include-compute docker
 EOF
 }
 
@@ -21,7 +22,12 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-ARG1="${1:?Usage: $0 <STATE_FILE|SESSION_NAME>}"
+INCLUDE_COMPUTE=0
+if [[ "${1:-}" == "--include-compute" ]]; then
+  INCLUDE_COMPUTE=1; shift || true
+fi
+
+ARG1="${1:?Usage: $0 [--include-compute] <STATE_FILE|SESSION_NAME>}"
 
 if [[ -f "${ARG1}" ]]; then
   STATE_FILE="${ARG1}"
@@ -52,22 +58,26 @@ echo "[*] Disk: ${DISK:-<none>}"
 echo "[*] Bucket: ${BUCKET:-<none>}"
 echo "[*] Prefix: ${REMOTE_PREFIX:-<none>}"
 
-# Detach disk (if both VM and DISK exist)
-if [[ -n "${VM:-}" && -n "${DISK:-}" && -n "${ZONE:-}" ]]; then
-  echo "[*] Detach disk ${DISK} from VM ${VM} (if attached)…"
-  gcloud compute instances detach-disk "${VM}" --disk="${DISK}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
-fi
+if [[ ${INCLUDE_COMPUTE} -eq 1 ]]; then
+  # Detach disk (if both VM and DISK exist)
+  if [[ -n "${VM:-}" && -n "${DISK:-}" && -n "${ZONE:-}" ]]; then
+    echo "[*] Detach disk ${DISK} from VM ${VM} (if attached)…"
+    gcloud compute instances detach-disk "${VM}" --disk="${DISK}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
+  fi
 
-# Delete VM
-if [[ -n "${VM:-}" && -n "${ZONE:-}" ]]; then
-  echo "[*] Delete VM ${VM}…"
-  gcloud compute instances delete "${VM}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
-fi
+  # Delete VM
+  if [[ -n "${VM:-}" && -n "${ZONE:-}" ]]; then
+    echo "[*] Delete VM ${VM}…"
+    gcloud compute instances delete "${VM}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
+  fi
 
-# Delete Disk
-if [[ -n "${DISK:-}" && -n "${ZONE:-}" ]]; then
-  echo "[*] Delete Disk ${DISK}…"
-  gcloud compute disks delete "${DISK}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
+  # Delete Disk
+  if [[ -n "${DISK:-}" && -n "${ZONE:-}" ]]; then
+    echo "[*] Delete Disk ${DISK}…"
+    gcloud compute disks delete "${DISK}" --zone="${ZONE}" --quiet >/dev/null 2>&1 || true
+  fi
+else
+  echo "[*] Skipping compute cleanup (use --include-compute to enable)."
 fi
 
 # Delete objects under prefix

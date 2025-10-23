@@ -1,8 +1,8 @@
-# gcs_transfer — Export GCE snapshot contents efficiently
+# Copy archived Google Cloud (GCS) Compute Engine archived snapshots to local disk reliably
 
 ## Overview
 
-- Mounts a GCE persistent disk snapshot read‑only on a tiny VM, streams the filesystem contents as compressed tarballs to a temporary GCS bucket, then downloads the artifacts locally and tears everything down.
+- Mounts a GCE persistent disk snapshot read‑only on a VM, streams the filesystem contents as compressed tarballs to a temporary GCS bucket, then downloads the artifacts locally and tears everything down.
 - Copies only the true contents of files, not empty disk blocks. This makes exports faster, smaller, and cheaper than raw image exports while preserving file data.
 
 ### Why “only true contents” helps
@@ -12,11 +12,17 @@
 - Safety: Mounts snapshots read‑only and excludes volatile/system paths to avoid transient data.
 - Portability: Produces standard `.tar.gz` archives that are easy to browse, verify, and restore.
 
-### How it works
+### How it works (flow)
 
-- Creates a temporary bucket and grants the Compute Engine default service account object admin on that bucket.
-- Creates a tiny VM, attaches a temporary disk from the snapshot, mounts partitions read‑only, and streams each partition to `gs://<bucket>/<prefix>/<partition>.tar.gz`.
-- Downloads the artifacts to `./exports/<prefix>/` locally and deletes compute resources. Optionally keeps the bucket/objects if `--keep-remote` is used.
+1) Enable required APIs (`compute.googleapis.com`, `storage.googleapis.com`).
+2) Pick an `UP` zone in your target region.
+3) Create a temporary GCS bucket and grant the project’s default Compute service account object admin on it.
+4) Create a temporary disk from the snapshot (read‑only), and a temporary VM (with fallback machine types).
+5) Attach the disk and push a small worker script to the VM.
+6) Stream the filesystem to GCS as `.tar.gz` archives (one per partition, or `root.tar.gz`/`ntfs-root.tar.gz`). Live progress is printed.
+7) Immediately delete the VM and temp disk to stop compute costs.
+8) Download artifacts to your machine with a resumable sync (can be resumed later).
+9) Optionally delete remote objects and the bucket (or keep them with `--keep-remote`).
 
 ## Prerequisites
 
@@ -34,40 +40,73 @@
 
 ## Usage
 
-- Command: `./transfer.sh <SNAPSHOT_NAME> <REGION> [--keep-remote] [--out-dir PATH]`
-- Examples:
-  - `./transfer.sh my-data-snap us-central1 --keep-remote`
-  - `./transfer.sh my-data-snap us-central1 --out-dir /tmp/export`
+- Export: `./export_gce_snapshot.sh <SNAPSHOT_NAME> <REGION> [options]`
+- Download only: `./download_gce_snapshot_export.sh <SESSION|STATE_FILE> [--out-dir PATH] [--only NAME]`
+- Cleanup: `./cleanup_gce_snapshot_export.sh [--include-compute] <SESSION|STATE_FILE>`
 
-### Arguments
+Examples
+- Export with confirmation: `./export_gce_snapshot.sh my-snap us-central1`
+- Export to custom dir and keep remote: `./export_gce_snapshot.sh my-snap us-central1 --out-dir /tmp/export --keep-remote`
+- Export with a friendly name: `./export_gce_snapshot.sh my-snap us-central1 --name docker`
+- Non‑interactive and delete state on success: `./export_gce_snapshot.sh my-snap us-central1 --silent --delete-state-at-end`
+- Download everything later (resumable): `./download_gce_snapshot_export.sh docker`
+- Download one archive and keep filename: `./download_gce_snapshot_export.sh docker --only root.tar.gz --out-dir /tmp/`
+- Cleanup storage (default): `./cleanup_gce_snapshot_export.sh docker`
+- Cleanup including compute (if needed): `./cleanup_gce_snapshot_export.sh --include-compute docker`
 
-- `SNAPSHOT_NAME`: Existing snapshot name in the active project
-- `REGION`: Region for the temporary resources (e.g., `us-central1`)
-- `--keep-remote`: Keep the temporary bucket and objects (skip storage cleanup)
- - `--out-dir PATH`: Download artifacts to `PATH` instead of `./exports/<prefix>`
+### Export options
+
+- `SNAPSHOT_NAME` (positional): Existing snapshot name in the active project
+- `REGION` (positional): Region for temporary resources (e.g. `us-central1`)
+- `--out-dir PATH`: Local destination root. The export creates `PATH/<snapshot-or-name>/` and `PATH/<snapshot-or-name>.state`.
+- `--name NAME`: Friendly alias; creates symlinks `./exports/NAME` and `./exports/NAME.state`.
+- `--keep-remote`: Keep bucket/objects (skip storage cleanup).
+- `--skip-local`: Skip the local download step; leave data only in GCS.
+- `--silent` (`-y`, `--yes`): Skip the upfront cost prompt.
+- `--delete-state-at-end`: With `--silent`, delete local state/temp files on successful download.
+- `--machine-type TYPE`: VM type; default is automatic fallback among fast, quota‑friendly types.
+- `--disk-type TYPE`: Temporary disk type for the snapshot (default `pd-ssd`).
+- `--mode archive|files`: Default `archive` streams tar.gz to GCS (fast and compact). `files` copies per‑file (slower for many small files).
+- `--cleanup STATEFILE`: Run cleanup immediately using a previous state file and exit.
 
 ### Outputs
 
-- Local artifacts at `./exports/<unique-prefix>/` (or `PATH` if `--out-dir` is used)
-- State file at `./exports/<unique-prefix>.state` (or `PATH.state` if `--out-dir` is used)
+- Local artifacts:
+  - Default: `./exports/<prefix>/`
+  - With `--out-dir`: `<out-dir>/<snapshot-or-name>/`
+- State file:
+  - Default: `./exports/<prefix>.state`
+  - With `--out-dir`: `<out-dir>/<snapshot-or-name>.state`
+- Remote artifacts in GCS: `gs://<bucket>/<prefix>/`
 
 ## Cleanup
 
-- Automatic: On success, compute resources are deleted. If `--keep-remote` is not used, the bucket/objects are removed.
-- Manual: If anything fails or you want to retry cleanup later:
-  - `./cleanup_gce_snapshot_export.sh ./exports/<unique-prefix>.state`
+- Automatic:
+  - VM and temp disk are deleted immediately after the remote upload finishes (before local download) to save costs.
+  - Storage cleanup runs at the very end only if not `--keep-remote` and the local download succeeded.
+- Manual:
+  - Storage only (default): `./cleanup_gce_snapshot_export.sh <SESSION|STATE_FILE>`
+  - Include compute (idempotent): `./cleanup_gce_snapshot_export.sh --include-compute <SESSION|STATE_FILE>`
 
 ## Notes and limitations
 
 - The script attempts to detect and mount partitions; if none are found, it falls back to mounting the whole device. It also tries NTFS via `ntfs-3g` for Windows snapshots.
-- Excludes transient/system paths (e.g., `/proc`, `/sys`, `/dev`, etc.) to keep exports clean and reproducible.
+- Excludes transient/system paths (e.g., `/proc`, `/sys`, `/dev`, etc.) when creating tarballs.
 - APIs `compute.googleapis.com` and `storage.googleapis.com` are enabled idempotently by the script.
+
+### Why stage in GCS?
+
+- Reliability and resumability: VM→GCS uploads are resumable; local downloads resume with `gsutil rsync`.
+- Cost efficiency: VM can be deleted immediately after upload; you only pay short‑lived GCS storage while downloading.
+- Permissions: grant the VM’s service account temporary object admin on one bucket; no long SSH streams to your local.
 
 ## Troubleshooting
 
 - “Set project”: run `gcloud config set project <YOUR_PROJECT_ID>`.
 - Auth errors: run `gcloud auth login` again (and optionally `gcloud auth application-default login`). Ensure your user has permissions to create Compute Engine resources and Storage buckets.
-- SSH readiness timeout: ensure your region has an `UP` zone available and that firewall rules allow SSH for the project (defaults typically suffice when using `gcloud compute ssh`).
+- SSH readiness timeout: ensure your region has an `UP` zone and SSH is allowed.
+- macOS + gsutil warnings about crcmod: install the C extension `python3 -m pip install -U crcmod` for fast checksums.
+- If `gsutil -m rsync` multiprocessing is problematic on macOS: `-o "GSUtil:parallel_process_count=1"` keeps multithreading.
 
 ## License
 

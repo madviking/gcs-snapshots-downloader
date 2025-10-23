@@ -380,7 +380,13 @@ if [[ -n "${SESSION_NAME:-}" ]]; then
   echo -e "${NAME_SAFE}\t${STATE_FILE}\t${BUCKET}\t${REMOTE_PREFIX}\t${TIMESTAMP}" >> "${EXPORTS_DIR}/sessions.tsv"
 fi
 
-# Local download
+# Compute cleanup immediately after remote upload to save costs
+log "Cleanup compute… (post-upload)"
+gcloud compute instances detach-disk "$VM" --disk="$TMP_DISK" --zone="$ZONE" --quiet >/dev/null || true
+gcloud compute instances delete "$VM" --zone="$ZONE" --quiet >/dev/null || true
+gcloud compute disks delete "$TMP_DISK" --zone="$ZONE" --quiet >/dev/null || true
+
+# Local download (runs after compute cleanup)
 trap - ERR
 DL_RC=0
 if [[ $SKIP_LOCAL -eq 1 ]]; then
@@ -411,12 +417,6 @@ fi
 
 SUCCESS=0
 if [[ $SKIP_LOCAL -ne 1 && ${DL_RC:-0} -eq 0 && -f "${LOCAL_DIR}/_OK" ]]; then SUCCESS=1; fi
-
-# Cleanup compute
-log "Cleanup compute…"
-gcloud compute instances detach-disk "$VM" --disk="$TMP_DISK" --zone="$ZONE" --quiet >/dev/null || true
-gcloud compute instances delete "$VM" --zone="$ZONE" --quiet >/dev/null || true
-gcloud compute disks delete "$TMP_DISK" --zone="$ZONE" --quiet >/dev/null || true
 
 # Cleanup storage unless kept
 if [[ $KEEP_REMOTE -eq 1 || $SKIP_LOCAL -eq 1 || ${DL_RC:-0} -ne 0 ]]; then
