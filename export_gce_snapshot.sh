@@ -145,6 +145,14 @@ SNAP_STORAGE_BYTES="$(gcloud compute snapshots describe "$SNAPSHOT_NAME" --forma
 [[ -n "$SNAP_STORAGE_BYTES" ]] && log "Snapshot storage: $(hr_bytes "$SNAP_STORAGE_BYTES")"
 [[ -n "$SNAP_DISK_GB" ]] && log "Snapshot disk size: ${SNAP_DISK_GB} GB"
 
+# Suggest crcmod install for faster local downloads (best-effort)
+if command -v gsutil >/dev/null 2>&1; then
+  CRC_LINE="$(gsutil version -l 2>/dev/null | grep -Ei 'compiled crcmod|crcmod' || true)"
+  if echo "$CRC_LINE" | grep -Eiq 'false|disabled|no'; then
+    log "Tip: Install compiled crcmod for faster downloads: ./install_crcmod.sh"
+  fi
+fi
+
 if [[ $SILENT -ne 1 ]]; then
   echo "Will create temp VM/disk/bucket in '${PROJECT}/${REGION}'. Costs apply."
   [[ -n "$SNAP_STORAGE_BYTES" ]] && echo "Estimated bytes: $(hr_bytes "$SNAP_STORAGE_BYTES")"
@@ -395,7 +403,8 @@ else
   log "Download from GCS → ${LOCAL_DIR}"
   set +e
   if command -v gsutil >/dev/null 2>&1; then
-    gsutil -m rsync -r -c "gs://${BUCKET}/${REMOTE_PREFIX}" "${LOCAL_DIR}/"; DL_RC=$?
+    OS="$(uname -s 2>/dev/null || echo unknown)"; PAR_OPTS=(); [[ "$OS" == "Darwin" ]] && PAR_OPTS=( -o "GSUtil:parallel_process_count=1" )
+    gsutil "${PAR_OPTS[@]}" -m rsync -r -c "gs://${BUCKET}/${REMOTE_PREFIX}" "${LOCAL_DIR}/"; DL_RC=$?
     if [[ $DL_RC -ne 0 ]]; then
       log "gsutil rsync failed (rc=$DL_RC); fallback to gcloud storage rsync/cp"
       if gcloud storage rsync --help >/dev/null 2>&1; then

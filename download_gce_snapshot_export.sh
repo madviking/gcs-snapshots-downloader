@@ -70,6 +70,26 @@ if [[ -z "${BUCKET:-}" || -z "${REMOTE_PREFIX:-}" ]]; then
   exit 2
 fi
 
+if command -v gsutil >/dev/null 2>&1; then
+  CRC_LINE="$(gsutil version -l 2>/dev/null | grep -Ei 'compiled crcmod|crcmod' || true)"
+  if echo "$CRC_LINE" | grep -Eiq 'false|disabled|no'; then
+    echo "[i] Faster downloads available with compiled crcmod. Run: ./install_crcmod.sh" >&2
+  fi
+fi
+
+OS="$(uname -s 2>/dev/null || echo unknown)"
+PAR_OPTS=()
+if [[ "$OS" == "Darwin" ]]; then
+  PAR_OPTS=( -o "GSUtil:parallel_process_count=1" )
+fi
+
+compiled_crcmod() {
+  if ! command -v gsutil >/dev/null 2>&1; then return 1; fi
+  local line
+  line="$(gsutil version -l 2>/dev/null | grep -Ei 'compiled crcmod|crcmod' || true)"
+  echo "$line" | grep -Eiq 'true' && return 0 || return 1
+}
+
 if [[ -n "$ONLY_NAME" ]]; then
   # Single-object download; create a folder named after the archive and save file inside
   SRC="gs://${BUCKET}/${REMOTE_PREFIX}/${ONLY_NAME}"
@@ -89,8 +109,15 @@ if [[ -n "$ONLY_NAME" ]]; then
   DEST="$DEST_DIR/$NAME_BASENAME"
 
   echo "[*] Downloading single archive to: $DEST"
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil cp -n "$SRC" "$DEST"
+  if command -v gsutil >/dev/null 2>&1 && compiled_crcmod && [[ -z "${GCS_TRANSFER_FORCE_GCLOUD:-}" ]]; then
+    set +e
+    gsutil "${PAR_OPTS[@]}" cp -n "$SRC" "$DEST"
+    RC=$?
+    set -e
+    if [[ $RC -ne 0 ]]; then
+      echo "[i] gsutil cp failed (rc=$RC); falling back to gcloud storage cp" >&2
+      gcloud storage cp "$SRC" "$DEST"
+    fi
   else
     gcloud storage cp "$SRC" "$DEST"
   fi
@@ -99,8 +126,19 @@ else
   DEST_DIR="${OUT_DIR:-${LOCAL_DIR:-./exports/${REMOTE_PREFIX}}}"
   mkdir -p "$DEST_DIR"
   echo "[*] Resumable download to: $DEST_DIR"
-  if command -v gsutil >/dev/null 2>&1; then
-    gsutil -m rsync -r -c "gs://${BUCKET}/${REMOTE_PREFIX}" "$DEST_DIR/"
+  if command -v gsutil >/dev/null 2>&1 && compiled_crcmod && [[ -z "${GCS_TRANSFER_FORCE_GCLOUD:-}" ]]; then
+    set +e
+    gsutil "${PAR_OPTS[@]}" -m rsync -r -c "gs://${BUCKET}/${REMOTE_PREFIX}" "$DEST_DIR/"
+    RC=$?
+    set -e
+    if [[ $RC -ne 0 ]]; then
+      echo "[i] gsutil rsync failed (rc=$RC); falling back to gcloud storage rsync/cp" >&2
+      if gcloud storage rsync --help >/dev/null 2>&1; then
+        gcloud storage rsync "gs://${BUCKET}/${REMOTE_PREFIX}" "$DEST_DIR/"
+      else
+        gcloud storage cp -r "gs://${BUCKET}/${REMOTE_PREFIX}/*" "$DEST_DIR/"
+      fi
+    fi
   elif gcloud storage rsync --help >/dev/null 2>&1; then
     gcloud storage rsync "gs://${BUCKET}/${REMOTE_PREFIX}" "$DEST_DIR/"
   else

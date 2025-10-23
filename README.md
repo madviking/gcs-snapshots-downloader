@@ -43,6 +43,7 @@
 - Export: `./export_gce_snapshot.sh <SNAPSHOT_NAME> <REGION> [options]`
 - Download only: `./download_gce_snapshot_export.sh <SESSION|STATE_FILE> [--out-dir PATH] [--only NAME]`
 - Cleanup: `./cleanup_gce_snapshot_export.sh [--include-compute] <SESSION|STATE_FILE>`
+ - Optional: install compiled crcmod for faster downloads: `./install_crcmod.sh`
 
 Examples
 - Export with confirmation: `./export_gce_snapshot.sh my-snap us-central1`
@@ -68,6 +69,16 @@ Examples
 - `--disk-type TYPE`: Temporary disk type for the snapshot (default `pd-ssd`).
 - `--mode archive|files`: Default `archive` streams tar.gz to GCS (fast and compact). `files` copies per‑file (slower for many small files).
 - `--cleanup STATEFILE`: Run cleanup immediately using a previous state file and exit.
+
+### Download options
+
+- `--out-dir PATH`: Override destination (default is the state file’s `LOCAL_DIR`).
+- `--only NAME`: Download a single archive (e.g., `root.tar.gz`). The downloader creates a folder named after the archive and saves the file inside with the same name.
+
+### Faster downloads (crcmod)
+
+- macOS/Linux: run `./install_crcmod.sh` to build crcmod with a C extension and print an `export CLOUDSDK_PYTHON=…` hint so gsutil uses that Python.
+- Verify: `gsutil version -l` should show compiled crcmod; sliced downloads will be enabled and rsync checksums speed up.
 
 ### Outputs
 
